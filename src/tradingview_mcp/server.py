@@ -32,6 +32,9 @@ from tradingview_mcp.core.services.regime_classifier import classify_regime as _
 from tradingview_mcp.core.services.arbitrage_detector import detect_arbitrage as _detect_arbitrage
 from tradingview_mcp.core.services.news_lag_detector import detect_news_lag as _detect_news_lag
 from tradingview_mcp.core.services.seasonality_detector import detect_seasonality as _detect_seasonality
+from tradingview_mcp.core.services.candlestick_patterns import detect_candlestick_patterns as _detect_candlestick_patterns
+from tradingview_mcp.core.services.chart_formations import detect_chart_formations as _detect_chart_formations
+from tradingview_mcp.core.services.support_resistance import detect_support_resistance as _detect_support_resistance
 
 try:
     from tradingview_ta import TA_Handler, get_multiple_analysis
@@ -3515,6 +3518,94 @@ def seasonality_detector(
         best/worst day and month, statistically significant patterns.
     """
     return _detect_seasonality(symbol, period, interval)
+
+
+@mcp.tool()
+def candlestick_pattern_scanner(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    min_reliability: str = "low",
+) -> dict:
+    """Scan for 25+ candlestick patterns — single-bar, dual-bar, and triple-bar formations.
+
+    Detects: Doji (standard/dragonfly/gravestone), Hammer, Inverted Hammer, Shooting Star,
+    Marubozu, Spinning Top, Bullish/Bearish Engulfing, Piercing Line, Dark Cloud Cover,
+    Tweezer Top/Bottom, Harami, Harami Cross, Morning Star, Evening Star,
+    Three White Soldiers, Three Black Crows, Three Inside Up/Down.
+
+    Each pattern includes RSI context for confirmation and reliability rating.
+
+    Args:
+        symbol:          Yahoo Finance symbol (BTC-USD, AAPL, ETH-USD…)
+        period:          Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:        '1d' (daily) or '1h' (hourly)
+        min_reliability: Filter by reliability: 'low', 'moderate', 'high'
+
+    Returns:
+        All patterns found with type (bullish/bearish/neutral), signal type,
+        reliability rating, recent bias, pattern frequency distribution.
+    """
+    return _detect_candlestick_patterns(symbol, period, interval, min_reliability)
+
+
+@mcp.tool()
+def chart_formation_scanner(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+) -> dict:
+    """Detect classical chart formations — multi-bar structural patterns.
+
+    Reversal patterns: Head & Shoulders (and Inverse), Double Top/Bottom,
+    Triple Top/Bottom, Rising/Falling Wedge.
+
+    Continuation patterns: Ascending/Descending/Symmetrical Triangle,
+    Bull Flag, Bear Flag, Pennant, Cup and Handle.
+
+    Trend structure: Ascending/Descending/Horizontal Channel with
+    current price position within channel.
+
+    Each formation includes price targets, necklines, and breakout direction.
+
+    Args:
+        symbol:   Yahoo Finance symbol (BTC-USD, AAPL, ETH-USD…)
+        period:   Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        All formations detected with pattern type, signal direction,
+        reliability, price targets, necklines, and breakout levels.
+    """
+    return _detect_chart_formations(symbol, period, interval)
+
+
+@mcp.tool()
+def support_resistance_mapper(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+    min_touches: int = 2,
+) -> dict:
+    """Map key support and resistance zones with multi-touch strength scoring.
+
+    Identifies S/R zones (not just single price points) by clustering pivot points,
+    then scores each zone by number of touches, volume at touches, and recency.
+
+    Includes: nearest S/R to current price, distance to levels, position assessment
+    (near support/resistance/mid-range), recent breakouts/breakdowns, ATR context.
+
+    Args:
+        symbol:      Yahoo Finance symbol (BTC-USD, AAPL, ETH-USD…)
+        period:      Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:    '1d' (daily) or '1h' (hourly)
+        min_touches: Minimum touches for a zone to be reported (default 2)
+
+    Returns:
+        Key S/R zones with strength scores (0-10), nearest support/resistance,
+        distance to levels, position assessment, recent breakout events.
+    """
+    return _detect_support_resistance(symbol, period, interval, min_touches=min_touches)
 
 
 @mcp.tool()
