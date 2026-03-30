@@ -17,7 +17,21 @@ from tradingview_mcp.core.utils.validators import sanitize_timeframe, sanitize_e
 from tradingview_mcp.core.services.sentiment_service import analyze_sentiment
 from tradingview_mcp.core.services.news_service import fetch_news_summary
 from tradingview_mcp.core.services.yahoo_finance_service import get_price, get_prices_bulk, get_market_snapshot
-from tradingview_mcp.core.services.backtest_service import run_backtest, compare_strategies as _compare_strategies, walk_forward_backtest
+from tradingview_mcp.core.services.backtest_service import run_backtest, compare_strategies as _compare_strategies, walk_forward_backtest, batch_walk_forward as _batch_walk_forward, out_of_sample_test as _out_of_sample_test
+from tradingview_mcp.core.services.security_checks import detect_rug_pull as _detect_rug_pull
+from tradingview_mcp.core.services.repaint_detector import detect_repaint as _detect_repaint
+from tradingview_mcp.core.services.divergence_detector import detect_divergences as _detect_divergences
+from tradingview_mcp.core.services.wash_trade_detector import detect_wash_trading as _detect_wash_trading
+from tradingview_mcp.core.services.correlation_detector import detect_correlation as _detect_correlation
+from tradingview_mcp.core.services.volatility_regime import detect_volatility_regime as _detect_volatility_regime
+from tradingview_mcp.core.services.stop_hunt_detector import detect_stop_hunts as _detect_stop_hunts
+from tradingview_mcp.core.services.dead_cat_detector import detect_dead_cat_bounce as _detect_dead_cat_bounce
+from tradingview_mcp.core.services.accumulation_detector import detect_accumulation as _detect_accumulation
+from tradingview_mcp.core.services.slippage_risk import detect_slippage_risk as _detect_slippage_risk
+from tradingview_mcp.core.services.regime_classifier import classify_regime as _classify_regime
+from tradingview_mcp.core.services.arbitrage_detector import detect_arbitrage as _detect_arbitrage
+from tradingview_mcp.core.services.news_lag_detector import detect_news_lag as _detect_news_lag
+from tradingview_mcp.core.services.seasonality_detector import detect_seasonality as _detect_seasonality
 
 try:
     from tradingview_ta import TA_Handler, get_multiple_analysis
@@ -3073,6 +3087,434 @@ def walk_forward_backtest_strategy(
         symbol, strategy, period, initial_capital,
         commission_pct, slippage_pct, n_splits, train_ratio, interval,
     )
+
+
+@mcp.tool()
+def rug_pull_detector(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    volume_spike_threshold: float = 3.0,
+    price_crash_threshold: float = -15.0,
+) -> dict:
+    """Detect potential rug pull indicators: crash events, whale dumps, pump-and-dump patterns, liquidity health.
+
+    Analyzes historical price and volume data for signs of market manipulation or
+    exit scams. Returns a risk score (0-100) with severity rating.
+
+    Args:
+        symbol:                 Yahoo Finance symbol — crypto (BTC-USD, ETH-USD, SOL-USD),
+                                stocks (AAPL, TSLA), meme coins, low-cap tokens
+        period:                 Historical data period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:               Timeframe: '1d' (daily, default) or '1h' (hourly)
+        volume_spike_threshold: Volume must be X times SMA20 to flag (default: 3.0)
+        price_crash_threshold:  Minimum % drop to flag as crash (default: -15%)
+
+    Returns:
+        Risk score (0-100), severity (CRITICAL/HIGH/MODERATE/LOW), crash events,
+        whale activity, pump-and-dump patterns, liquidity health assessment.
+    """
+    return _detect_rug_pull(
+        symbol, period, interval,
+        volume_spike_threshold, price_crash_threshold,
+    )
+
+
+@mcp.tool()
+def repaint_detector(
+    symbol: str,
+    strategy: str,
+    period: str = "1y",
+    interval: str = "1d",
+) -> dict:
+    """Detect signal repainting — validates whether a strategy's signals are stable
+    or change after the fact (making backtest results unreliable).
+
+    Compares signals generated bar-by-bar (simulating live trading) vs signals
+    computed with full hindsight (backtest view). If they differ, the signal repaints.
+
+    Args:
+        symbol:   Yahoo Finance symbol (BTC-USD, AAPL, ETH-USD, SPY…)
+        strategy: Strategy to test for repainting:
+                    'rsi'        — RSI Oversold/Overbought
+                    'bollinger'  — Bollinger Band Mean Reversion
+                    'macd'       — MACD Crossover
+                    'ema_cross'  — EMA 20/50 Golden/Death Cross
+                    'supertrend' — Supertrend (ATR-based)
+                    'donchian'   — Donchian Channel Breakout
+        period:   Historical data period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval: Timeframe: '1d' (daily, default) or '1h' (hourly)
+
+    Returns:
+        Stability score (0-1), repaint rate %, phantom/vanished/flipped signal counts,
+        risk level, verdict, and repaint details per affected bar.
+    """
+    return _detect_repaint(symbol, strategy, period, interval)
+
+
+@mcp.tool()
+def batch_walk_forward_test(
+    symbols: list[str],
+    strategy: str,
+    period: str = "2y",
+    initial_capital: float = 10000.0,
+    n_splits: int = 3,
+    train_ratio: float = 0.7,
+    interval: str = "1d",
+) -> dict:
+    """Walk-forward backtest across multiple currencies/symbols — validate strategy robustness
+    across diverse instruments to ensure it isn't curve-fitted to a single asset.
+
+    Runs the same walk-forward overfitting test on each symbol independently, then
+    aggregates cross-symbol statistics to determine overall strategy quality.
+
+    Args:
+        symbols:         List of Yahoo Finance symbols, e.g. ['BTC-USD', 'ETH-USD', 'SOL-USD']
+                         or ['AAPL', 'TSLA', 'NVDA']. Max 50 symbols.
+        strategy:        rsi | bollinger | macd | ema_cross | supertrend | donchian
+        period:          Historical data period: '1mo', '3mo', '6mo', '1y', '2y'
+        initial_capital: Starting capital per symbol (default: $10,000)
+        n_splits:        Number of walk-forward folds (default: 3, max: 10)
+        train_ratio:     Fraction of each fold for training (default: 0.7)
+        interval:        Timeframe: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Per-symbol robustness scores, aggregate cross-symbol statistics,
+        overall verdict, and breakdown of robust/moderate/weak/overfit counts.
+    """
+    return _batch_walk_forward(
+        symbols, strategy, period, initial_capital,
+        0.1, 0.05, n_splits, train_ratio, interval,
+    )
+
+
+@mcp.tool()
+def out_of_sample_test(
+    symbol: str,
+    strategy: str,
+    period: str = "2y",
+    initial_capital: float = 10000.0,
+    oos_ratio: float = 0.3,
+    interval: str = "1d",
+) -> dict:
+    """Pure out-of-sample test — train on historical data, test on held-out recent data.
+
+    Unlike walk-forward (rolling folds), this does a single clean chronological split:
+      - Training set: first (1 - oos_ratio) of data (older data)
+      - Test set: last oos_ratio of data (most recent, never seen during training)
+
+    Simulates deploying a strategy tuned on past data and measuring its real
+    forward performance on data that didn't exist when the strategy was tuned.
+
+    Args:
+        symbol:          Yahoo Finance symbol (AAPL, BTC-USD, SPY…)
+        strategy:        rsi | bollinger | macd | ema_cross | supertrend | donchian
+        period:          Historical data period: '1mo', '3mo', '6mo', '1y', '2y'
+        initial_capital: Starting capital in USD (default: $10,000)
+        oos_ratio:       Fraction of data held out for testing (default: 0.3 = 30%)
+        interval:        Timeframe: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Side-by-side train vs test metrics, degradation ratio, Sharpe degradation,
+        verdict (ROBUST/MODERATE/WEAK/OVERFITTED).
+    """
+    return _out_of_sample_test(
+        symbol, strategy, period, initial_capital,
+        0.1, 0.05, oos_ratio, interval,
+    )
+
+
+@mcp.tool()
+def divergence_detector(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+    indicators: list[str] = None,
+) -> dict:
+    """Detect RSI, MACD, and OBV divergences from price — one of the most reliable reversal signals.
+
+    Finds bullish divergence (price lower low + indicator higher low), bearish divergence
+    (price higher high + indicator lower high), and hidden divergences (trend continuation).
+
+    Args:
+        symbol:     Yahoo Finance symbol (BTC-USD, AAPL, ETH-USD…)
+        period:     Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:   '1d' (daily) or '1h' (hourly)
+        indicators: Which indicators to check: ['rsi', 'macd', 'obv'] (default: all)
+
+    Returns:
+        All divergences found (bullish, bearish, hidden), active signal direction,
+        recent divergences with strength scores.
+    """
+    return _detect_divergences(symbol, period, interval, indicators=indicators)
+
+
+@mcp.tool()
+def wash_trade_detector(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+) -> dict:
+    """Detect fake volume / wash trading — artificial volume that doesn't move price.
+
+    Analyzes volume-price correlation, volume clustering (repeated identical bars),
+    volume-volatility mismatch, round-number volume ratio, and volume distribution.
+
+    Args:
+        symbol:   Yahoo Finance symbol
+        period:   Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Wash trade probability score (0-100), risk level, evidence list, detailed metrics.
+    """
+    return _detect_wash_trading(symbol, period, interval)
+
+
+@mcp.tool()
+def correlation_detector(
+    symbol: str,
+    benchmarks: list[str] = None,
+    period: str = "1y",
+    interval: str = "1d",
+) -> dict:
+    """Analyze correlation, beta, and alpha vs benchmarks — detect if a coin just mirrors BTC/SPY.
+
+    Computes Pearson correlation, rolling correlation, beta (market sensitivity),
+    alpha (excess return), and detects decoupling events.
+
+    Args:
+        symbol:     Yahoo Finance symbol to analyze
+        benchmarks: Benchmark symbols to compare (default: BTC-USD, ETH-USD, SPY)
+        period:     Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:   '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Per-benchmark correlation/beta/alpha, independence score,
+        rolling correlation stats, decoupling events.
+    """
+    return _detect_correlation(symbol, benchmarks, period, interval)
+
+
+@mcp.tool()
+def volatility_regime_detector(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+) -> dict:
+    """Classify current volatility regime — LOW / NORMAL / HIGH / EXTREME.
+
+    Strategies behave very differently across regimes. RSI works in low-vol,
+    Supertrend works in high-vol. This detector recommends which strategies
+    to use and which to avoid based on current conditions.
+
+    Uses ATR percentile, Bollinger Band Width, daily range, and returns volatility.
+
+    Args:
+        symbol:   Yahoo Finance symbol
+        period:   Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Regime classification, composite percentile, component breakdown,
+        strategy recommendations, squeeze detection, regime transitions.
+    """
+    return _detect_volatility_regime(symbol, period, interval)
+
+
+@mcp.tool()
+def stop_hunt_detector(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    wick_threshold: float = 2.0,
+) -> dict:
+    """Detect stop hunt / liquidity trap patterns — wicks that sweep S/R then reverse.
+
+    Identifies manipulation where price spikes past support/resistance to trigger
+    stop-losses, then immediately reverses. Common in crypto and thin markets.
+
+    Args:
+        symbol:         Yahoo Finance symbol
+        period:         Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:       '1d' (daily) or '1h' (hourly)
+        wick_threshold: Min wick-to-body ratio to flag (default 2.0)
+
+    Returns:
+        Stop hunt events (upside/downside traps), hunt clusters (price zones),
+        frequency analysis, risk assessment, S/R levels identified.
+    """
+    return _detect_stop_hunts(symbol, period, interval, wick_threshold)
+
+
+@mcp.tool()
+def dead_cat_bounce_detector(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+    crash_threshold: float = -20.0,
+) -> dict:
+    """Detect dead cat bounces — relief rallies after crashes that fail to sustain.
+
+    After a major drop, detects bounces that show weak characteristics:
+    lower highs, declining volume, shallow Fibonacci retracement, weak RSI.
+
+    Args:
+        symbol:          Yahoo Finance symbol
+        period:          Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval:        '1d' (daily) or '1h' (hourly)
+        crash_threshold: Min % drop to qualify as crash (default -20%)
+
+    Returns:
+        Crashes found, bounce classifications (dead cat vs genuine recovery),
+        current state assessment if in active bounce.
+    """
+    return _detect_dead_cat_bounce(symbol, period, interval, crash_threshold)
+
+
+@mcp.tool()
+def accumulation_distribution_detector(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+) -> dict:
+    """Detect smart money accumulation and distribution phases via OBV and A/D line.
+
+    Price flat + rising OBV = smart money accumulating (bullish).
+    Price flat + falling OBV = smart money distributing (bearish).
+    Also detects markup, markdown, and divergence phases.
+
+    Args:
+        symbol:   Yahoo Finance symbol
+        period:   Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Current phase (ACCUMULATION/DISTRIBUTION/MARKUP/MARKDOWN/NEUTRAL),
+        smart money signal, phase history, accumulation/distribution zones.
+    """
+    return _detect_accumulation(symbol, period, interval)
+
+
+@mcp.tool()
+def slippage_risk_detector(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+    trade_sizes_usd: list[float] = None,
+) -> dict:
+    """Estimate realistic slippage for various position sizes — validates backtester assumptions.
+
+    The backtester uses a flat 0.05% slippage, but for low-liquidity assets that's wildly
+    optimistic. This tool computes realistic slippage based on volume profile.
+
+    Args:
+        symbol:          Yahoo Finance symbol
+        period:          Historical period
+        interval:        '1d' or '1h'
+        trade_sizes_usd: Position sizes to estimate (default: [1k, 5k, 10k, 50k, 100k])
+
+    Returns:
+        Liquidity tier, per-size slippage estimates, volume metrics, spread analysis,
+        recommended backtester slippage_pct, comparison to default assumption.
+    """
+    return _detect_slippage_risk(symbol, period, interval, trade_sizes_usd)
+
+
+@mcp.tool()
+def market_regime_classifier(
+    symbol: str,
+    period: str = "6mo",
+    interval: str = "1d",
+) -> dict:
+    """Classify market regime — TRENDING UP / TRENDING DOWN / RANGING / CHOPPY.
+
+    Uses ADX for trend strength, +DI/-DI for direction, Efficiency Ratio for noise,
+    and EMA alignment for confirmation. Returns per-strategy fitness scores.
+
+    Args:
+        symbol:   Yahoo Finance symbol
+        period:   Historical period: '1mo', '3mo', '6mo', '1y', '2y'
+        interval: '1d' (daily) or '1h' (hourly)
+
+    Returns:
+        Regime classification, confidence, indicator values, strategy fitness scores
+        (0-1 per strategy), regime history timeline.
+    """
+    return _classify_regime(symbol, period, interval)
+
+
+@mcp.tool()
+def arbitrage_detector(
+    base_symbol: str,
+    compare_symbols: list[str] = None,
+    period: str = "1mo",
+    interval: str = "1d",
+) -> dict:
+    """Detect cross-instrument arbitrage opportunities by comparing price feeds.
+
+    Compares a crypto asset against its ETF/trust equivalents (e.g., BTC-USD vs GBTC/BITO/IBIT)
+    or user-specified symbol pairs. Detects premium/discount and anomalous spread windows.
+
+    Args:
+        base_symbol:     Primary Yahoo Finance symbol (e.g., 'BTC-USD')
+        compare_symbols: Symbols to compare (default: auto-selected ETFs/trusts)
+        period:          Historical period
+        interval:        '1d' or '1h'
+
+    Returns:
+        Per-pair spread analysis, z-scores, active opportunities,
+        historical arbitrage windows.
+    """
+    return _detect_arbitrage(base_symbol, compare_symbols, period, interval)
+
+
+@mcp.tool()
+def news_price_lag_detector(
+    symbol: str,
+    period: str = "3mo",
+    interval: str = "1d",
+    category: str = "crypto",
+) -> dict:
+    """Analyze the relationship between news/sentiment and price movements.
+
+    Checks whether news leads or lags price, measures follow-through after
+    volume spikes, and determines if news-driven trading is profitable.
+
+    Args:
+        symbol:   Yahoo Finance symbol
+        period:   Historical period: '1mo', '3mo', '6mo', '1y'
+        interval: '1d' (daily)
+        category: News category: 'crypto', 'stocks', 'all'
+
+    Returns:
+        Sentiment-price alignment, volume spike follow-through analysis,
+        news tradability assessment, momentum at multiple horizons.
+    """
+    return _detect_news_lag(symbol, period, interval, category)
+
+
+@mcp.tool()
+def seasonality_detector(
+    symbol: str,
+    period: str = "2y",
+    interval: str = "1d",
+) -> dict:
+    """Detect day-of-week and month-of-year seasonal patterns with statistical testing.
+
+    Finds patterns like Monday effect, January effect, sell-in-May, etc.
+    Uses bootstrap significance testing to distinguish real patterns from noise.
+
+    Args:
+        symbol:   Yahoo Finance symbol
+        period:   Historical period (recommend '2y' for monthly patterns)
+        interval: '1d' (daily — required for meaningful seasonal analysis)
+
+    Returns:
+        Day-of-week avg returns/win rates, month-of-year analysis,
+        best/worst day and month, statistically significant patterns.
+    """
+    return _detect_seasonality(symbol, period, interval)
 
 
 @mcp.tool()

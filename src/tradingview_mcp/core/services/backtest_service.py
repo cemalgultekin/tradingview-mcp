@@ -625,3 +625,260 @@ def walk_forward_backtest(
         "disclaimer":              "Past performance does not guarantee future results. For educational use only.",
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ─── Public API: batch_walk_forward ─────────────────────────────────────────
+
+def batch_walk_forward(
+    symbols: list[str],
+    strategy: str,
+    period: str = "2y",
+    initial_capital: float = 10_000.0,
+    commission_pct: float = 0.1,
+    slippage_pct: float = 0.05,
+    n_splits: int = 3,
+    train_ratio: float = 0.7,
+    interval: str = "1d",
+) -> dict:
+    """
+    Run walk-forward backtesting across multiple symbols for a given strategy.
+
+    Tests the same strategy on each symbol independently and aggregates results
+    to determine overall strategy robustness across diverse instruments.
+
+    Returns per-symbol results + aggregate statistics for cross-validation.
+    """
+    strategy = strategy.lower().strip()
+    if strategy not in _STRATEGY_MAP:
+        return {"error": f"Unknown strategy '{strategy}'. Choose: {', '.join(_STRATEGY_MAP)}"}
+    if not symbols or len(symbols) > 50:
+        return {"error": "Provide 1-50 symbols."}
+
+    results = []
+    errors = []
+
+    for sym in symbols:
+        sym = sym.strip().upper()
+        if not sym:
+            continue
+        res = walk_forward_backtest(
+            sym, strategy, period, initial_capital,
+            commission_pct, slippage_pct, n_splits, train_ratio, interval,
+        )
+        if "error" in res:
+            errors.append({"symbol": sym, "error": res["error"]})
+        else:
+            results.append(res)
+
+    if not results:
+        return {
+            "error": "No symbols produced valid results.",
+            "failed_symbols": errors,
+        }
+
+    # Aggregate cross-symbol OOS metrics
+    robustness_scores = [r["robustness_score"] for r in results]
+    oos_returns = [r["oos_total_return_pct"] for r in results]
+    oos_sharpes = [r["oos_sharpe_ratio"] for r in results]
+    oos_drawdowns = [r["oos_max_drawdown_pct"] for r in results]
+    oos_win_rates = [r["oos_win_rate_pct"] for r in results]
+
+    avg_robustness = round(statistics.mean(robustness_scores), 2)
+    avg_oos_return = round(statistics.mean(oos_returns), 2)
+    avg_oos_sharpe = round(statistics.mean(oos_sharpes), 2)
+    avg_oos_drawdown = round(statistics.mean(oos_drawdowns), 2)
+
+    robust_count = sum(1 for s in robustness_scores if s >= 0.8)
+    moderate_count = sum(1 for s in robustness_scores if 0.5 <= s < 0.8)
+    weak_count = sum(1 for s in robustness_scores if 0.2 <= s < 0.5)
+    overfit_count = sum(1 for s in robustness_scores if s < 0.2)
+
+    # Cross-symbol consistency: low std = strategy works uniformly
+    rob_std = round(statistics.stdev(robustness_scores), 2) if len(robustness_scores) > 1 else 0.0
+
+    if avg_robustness >= 0.8 and rob_std < 0.2:
+        overall_verdict = "ROBUST — strategy performs well across instruments with low variance"
+    elif avg_robustness >= 0.6:
+        overall_verdict = "MODERATE — strategy works on some instruments but not uniformly"
+    elif avg_robustness >= 0.3:
+        overall_verdict = "WEAK — strategy shows significant degradation across instruments"
+    else:
+        overall_verdict = "OVERFITTED — strategy fails out-of-sample on most instruments"
+
+    # Per-symbol summary (compact)
+    symbol_summary = []
+    for r in sorted(results, key=lambda x: x["robustness_score"], reverse=True):
+        symbol_summary.append({
+            "symbol": r["symbol"],
+            "robustness_score": r["robustness_score"],
+            "verdict": r["verdict"].split(" — ")[0],
+            "oos_return_pct": r["oos_total_return_pct"],
+            "oos_sharpe": r["oos_sharpe_ratio"],
+            "oos_max_drawdown_pct": r["oos_max_drawdown_pct"],
+            "oos_win_rate_pct": r["oos_win_rate_pct"],
+            "oos_trades": r["oos_total_trades"],
+        })
+
+    return {
+        "strategy": strategy,
+        "strategy_label": _STRATEGY_LABELS[strategy],
+        "period": period,
+        "interval": interval,
+        "timeframe": "Hourly (1h)" if interval == "1h" else "Daily (1d)",
+        "n_splits": n_splits,
+        "train_ratio": train_ratio,
+        "symbols_tested": len(results),
+        "symbols_failed": len(errors),
+        "aggregate": {
+            "avg_robustness_score": avg_robustness,
+            "robustness_std": rob_std,
+            "avg_oos_return_pct": avg_oos_return,
+            "avg_oos_sharpe": avg_oos_sharpe,
+            "avg_oos_max_drawdown_pct": avg_oos_drawdown,
+            "robust_count": robust_count,
+            "moderate_count": moderate_count,
+            "weak_count": weak_count,
+            "overfit_count": overfit_count,
+        },
+        "overall_verdict": overall_verdict,
+        "symbol_results": symbol_summary,
+        "failed_symbols": errors if errors else None,
+        "initial_capital": round(initial_capital, 2),
+        "commission_pct": commission_pct,
+        "slippage_pct": slippage_pct,
+        "data_source": "Yahoo Finance",
+        "disclaimer": "Past performance does not guarantee future results. For educational use only.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ─── Public API: out_of_sample_test ─────────────────────────────────────────
+
+def out_of_sample_test(
+    symbol: str,
+    strategy: str,
+    period: str = "2y",
+    initial_capital: float = 10_000.0,
+    commission_pct: float = 0.1,
+    slippage_pct: float = 0.05,
+    oos_ratio: float = 0.3,
+    interval: str = "1d",
+) -> dict:
+    """
+    Pure out-of-sample test — train on early data, test on held-out recent data.
+
+    Unlike walk-forward (which uses rolling folds), this does a single clean split:
+      - Training set: first (1 - oos_ratio) of data
+      - Test set: last oos_ratio of data (most recent, never seen during training)
+
+    This simulates deploying a strategy tuned on historical data and measuring
+    real forward performance on data that didn't exist when the strategy was tuned.
+    """
+    strategy = strategy.lower().strip()
+    period = period.lower().strip()
+    interval = interval.lower().strip()
+
+    if strategy not in _STRATEGY_MAP:
+        return {"error": f"Unknown strategy '{strategy}'. Choose: {', '.join(_STRATEGY_MAP)}"}
+    if period not in _VALID_PERIODS:
+        return {"error": f"Invalid period '{period}'. Choose: {', '.join(_VALID_PERIODS)}"}
+    if interval not in _VALID_INTERVALS:
+        return {"error": f"Invalid interval '{interval}'. Choose: 1d or 1h"}
+    if not (0.1 <= oos_ratio <= 0.5):
+        return {"error": "oos_ratio must be between 0.1 and 0.5"}
+
+    try:
+        candles = _fetch_ohlcv(symbol, period, interval)
+    except Exception as e:
+        return {"error": f"Failed to fetch data for '{symbol}': {e}"}
+
+    if len(candles) < 60:
+        return {"error": f"Not enough data ({len(candles)} bars). Try a longer period."}
+
+    split_idx = int(len(candles) * (1 - oos_ratio))
+    train_candles = candles[:split_idx]
+    test_candles = candles[split_idx:]
+
+    if len(train_candles) < 30 or len(test_candles) < 10:
+        return {"error": "Split produces insufficient data in one or both sets."}
+
+    fn = _STRATEGY_MAP[strategy]
+
+    # Run strategy on both sets independently
+    train_trades = _apply_costs(fn(train_candles), commission_pct, slippage_pct)
+    test_trades = _apply_costs(fn(test_candles), commission_pct, slippage_pct)
+
+    train_m = _calc_metrics(train_trades, initial_capital, interval)
+    test_m = _calc_metrics(test_trades, initial_capital, interval)
+
+    train_bnh = _buy_and_hold_return(train_candles)
+    test_bnh = _buy_and_hold_return(test_candles)
+
+    # Performance degradation ratio
+    tr, te = train_m["total_return_pct"], test_m["total_return_pct"]
+    if tr == 0:
+        degradation_ratio = 1.0 if te == 0 else 0.0
+    elif tr < 0 and te < 0:
+        degradation_ratio = round(min(te / tr, 2.0), 2)
+    elif tr < 0:
+        degradation_ratio = 0.0
+    else:
+        degradation_ratio = round(max(min(te / tr, 2.0), -1.0), 2)
+
+    # Sharpe degradation
+    sharpe_deg = 0.0
+    if train_m["sharpe_ratio"] != 0:
+        sharpe_deg = round(test_m["sharpe_ratio"] / train_m["sharpe_ratio"], 2)
+
+    if degradation_ratio >= 0.8 and sharpe_deg >= 0.7:
+        verdict = "ROBUST — strategy generalizes well to unseen recent data"
+    elif degradation_ratio >= 0.5:
+        verdict = "MODERATE — some performance loss on unseen data, use caution"
+    elif degradation_ratio >= 0.2:
+        verdict = "WEAK — significant degradation, strategy may be curve-fitted"
+    else:
+        verdict = "OVERFITTED — strategy fails on unseen data, do not deploy"
+
+    return {
+        "symbol": symbol.upper(),
+        "strategy": strategy,
+        "strategy_label": _STRATEGY_LABELS[strategy],
+        "period": period,
+        "interval": interval,
+        "timeframe": "Hourly (1h)" if interval == "1h" else "Daily (1d)",
+        "total_candles": len(candles),
+        "oos_ratio": oos_ratio,
+        "train_set": {
+            "candles": len(train_candles),
+            "date_from": train_candles[0]["date"],
+            "date_to": train_candles[-1]["date"],
+            "total_return_pct": train_m["total_return_pct"],
+            "win_rate_pct": train_m["win_rate_pct"],
+            "total_trades": train_m["total_trades"],
+            "sharpe_ratio": train_m["sharpe_ratio"],
+            "max_drawdown_pct": train_m["max_drawdown_pct"],
+            "profit_factor": train_m["profit_factor"],
+            "buy_and_hold_pct": train_bnh,
+        },
+        "test_set": {
+            "candles": len(test_candles),
+            "date_from": test_candles[0]["date"],
+            "date_to": test_candles[-1]["date"],
+            "total_return_pct": test_m["total_return_pct"],
+            "win_rate_pct": test_m["win_rate_pct"],
+            "total_trades": test_m["total_trades"],
+            "sharpe_ratio": test_m["sharpe_ratio"],
+            "max_drawdown_pct": test_m["max_drawdown_pct"],
+            "profit_factor": test_m["profit_factor"],
+            "buy_and_hold_pct": test_bnh,
+        },
+        "degradation_ratio": degradation_ratio,
+        "sharpe_degradation_ratio": sharpe_deg,
+        "verdict": verdict,
+        "initial_capital": round(initial_capital, 2),
+        "commission_pct": commission_pct,
+        "slippage_pct": slippage_pct,
+        "data_source": "Yahoo Finance",
+        "disclaimer": "Past performance does not guarantee future results. For educational use only.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
