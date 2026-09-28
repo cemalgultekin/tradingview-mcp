@@ -898,7 +898,7 @@ def walk_forward_backtest_strategy(
 
 # ── Fork additions: detectors, pattern & formation scanners ───────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Rug Pull Risk Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def rug_pull_detector(
     symbol: str,
     period: str = "6mo",
@@ -929,7 +929,7 @@ def rug_pull_detector(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Indicator Repaint Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def repaint_detector(
     symbol: str,
     strategy: str,
@@ -961,7 +961,7 @@ def repaint_detector(
     return _detect_repaint(symbol, strategy, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Batch Walk-Forward Test", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def batch_walk_forward_test(
     symbols: list[str],
     strategy: str,
@@ -997,7 +997,7 @@ def batch_walk_forward_test(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Out-of-Sample Validation", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def out_of_sample_test(
     symbol: str,
     strategy: str,
@@ -1033,7 +1033,7 @@ def out_of_sample_test(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Momentum Divergence Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def divergence_detector(
     symbol: str,
     period: str = "1y",
@@ -1058,7 +1058,7 @@ def divergence_detector(
     return _detect_divergences(symbol, period, interval, indicators=indicators)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Wash Trading Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def wash_trade_detector(
     symbol: str,
     period: str = "6mo",
@@ -1080,7 +1080,7 @@ def wash_trade_detector(
     return _detect_wash_trading(symbol, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Cross-Asset Correlation", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def correlation_detector(
     symbol: str,
     benchmarks: list[str] = None,
@@ -1105,7 +1105,7 @@ def correlation_detector(
     return _detect_correlation(symbol, benchmarks, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Volatility Regime Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def volatility_regime_detector(
     symbol: str,
     period: str = "1y",
@@ -1131,7 +1131,7 @@ def volatility_regime_detector(
     return _detect_volatility_regime(symbol, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Stop Hunt Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def stop_hunt_detector(
     symbol: str,
     period: str = "6mo",
@@ -1156,7 +1156,7 @@ def stop_hunt_detector(
     return _detect_stop_hunts(symbol, period, interval, wick_threshold)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Dead Cat Bounce Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def dead_cat_bounce_detector(
     symbol: str,
     period: str = "1y",
@@ -1181,7 +1181,7 @@ def dead_cat_bounce_detector(
     return _detect_dead_cat_bounce(symbol, period, interval, crash_threshold)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Accumulation and Distribution Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def accumulation_distribution_detector(
     symbol: str,
     period: str = "6mo",
@@ -1205,7 +1205,7 @@ def accumulation_distribution_detector(
     return _detect_accumulation(symbol, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Slippage and Liquidity Risk", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def slippage_risk_detector(
     symbol: str,
     period: str = "6mo",
@@ -1230,7 +1230,7 @@ def slippage_risk_detector(
     return _detect_slippage_risk(symbol, period, interval, trade_sizes_usd)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Market Regime Classifier", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def market_regime_classifier(
     symbol: str,
     period: str = "6mo",
@@ -1253,7 +1253,7 @@ def market_regime_classifier(
     return _classify_regime(symbol, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Cross-Exchange Arbitrage Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def arbitrage_detector(
     base_symbol: str,
     compare_symbols: list[str] = None,
@@ -1278,7 +1278,7 @@ def arbitrage_detector(
     return _detect_arbitrage(base_symbol, compare_symbols, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="News-Price Lag Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def news_price_lag_detector(
     symbol: str,
     period: str = "3mo",
@@ -1303,7 +1303,7 @@ def news_price_lag_detector(
     return _detect_news_lag(symbol, period, interval, category)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Seasonality Detector", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def seasonality_detector(
     symbol: str,
     period: str = "2y",
@@ -1326,7 +1326,7 @@ def seasonality_detector(
     return _detect_seasonality(symbol, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Candlestick Pattern Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def candlestick_pattern_scanner(
     symbol: str,
     period: str = "6mo",
@@ -1355,7 +1355,7 @@ def candlestick_pattern_scanner(
     return _detect_candlestick_patterns(symbol, period, interval, min_reliability)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Chart Formation Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def chart_formation_scanner(
     symbol: str,
     period: str = "1y",
@@ -1386,7 +1386,7 @@ def chart_formation_scanner(
     return _detect_chart_formations(symbol, period, interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Support and Resistance Mapper", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def support_resistance_mapper(
     symbol: str,
     period: str = "1y",
