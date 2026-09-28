@@ -22,7 +22,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from tradingview_mcp.core.services.indicators_calc import (
-    calc_rsi, calc_bollinger, calc_macd, calc_ema, calc_supertrend, calc_donchian,
+    calc_rsi, calc_bollinger, calc_macd, calc_ema, calc_sma, calc_atr,
+    calc_supertrend, calc_donchian,
 )
 
 _UA       = "tradingview-mcp/0.7.0 backtest-bot"
@@ -32,22 +33,34 @@ _VALID_PERIODS   = {"1mo", "3mo", "6mo", "1y", "2y"}
 _VALID_INTERVALS = {"1d", "1h"}
 
 # Annualization factor for Sharpe ratio
-_ANNUALIZATION = {"1d": 252, "1h": 252 * 6}
+# Bars per year: 252 trading days; US regular session is 6.5 hours → 6.5
+# hourly bars per day. Callers on other markets (e.g. EGX: ~245 sessions of
+# 4.5h, EGP risk-free ~25%) should pass periods_per_year / risk_free_rate
+# explicitly — these are US-market defaults.
+_ANNUALIZATION = {"1d": 252, "1h": int(252 * 6.5)}
+_DEFAULT_RISK_FREE = 0.04  # annual, decimal
 
 _STRATEGY_LABELS = {
-    "rsi":        "RSI Oversold/Overbought",
-    "bollinger":  "Bollinger Band Mean Reversion",
-    "macd":       "MACD Crossover",
-    "ema_cross":  "EMA 20/50 Golden/Death Cross",
-    "supertrend": "Supertrend (ATR-based Trend Following)",
-    "donchian":   "Donchian Channel Breakout",
+    "rsi":              "RSI Oversold/Overbought",
+    "bollinger":        "Bollinger Band Mean Reversion",
+    "macd":             "MACD Crossover",
+    "ema_cross":        "EMA 20/50 Golden/Death Cross",
+    "supertrend":       "Supertrend (ATR-based Trend Following)",
+    "donchian":         "Donchian Channel Breakout",
+    "rsi_pullback":     "RSI Pullback in Uptrend (SMA50>SMA200)",
+    "keltner_breakout": "Keltner Channel Breakout (EMA20 + 2·ATR)",
+    "triple_ema":       "EMA 20/50 Cross with SMA200 Trend Filter",
 }
+
+# Strategies that require SMA200 warmup → need ≥220 bars to produce signals
+_SMA200_STRATEGIES = {"rsi_pullback", "triple_ema"}
+_SMA200_MIN_BARS  = 220
 
 
 # ─── Data Fetching ────────────────────────────────────────────────────────────
 
 def _fetch_ohlcv(symbol: str, period: str, interval: str = "1d") -> list[dict]:
-    url = f"{_YF_BASE}/{symbol}?interval={interval}&range={period}"
+    url = f"{_YF_BASE}/{symbol}?interval={interval}&range={period}&includeAdjustedClose=true"
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
 
     data = None
@@ -71,11 +84,24 @@ def _fetch_ohlcv(symbol: str, period: str, interval: str = "1d") -> list[dict]:
     q          = result["indicators"]["quote"][0]
     date_fmt   = "%Y-%m-%d %H:%M" if interval == "1h" else "%Y-%m-%d"
 
+    # Dividend/split adjustment: Yahoo's quote array is split-adjusted only.
+    # High-yield markets (EGX pays 5-15% cash) book phantom losses on ex-div
+    # gaps and understate buy-and-hold without this. Scale OHLC by the
+    # per-bar adjclose/close factor when Yahoo provides adjclose (daily bars).
+    adj = None
+    try:
+        adj = result["indicators"]["adjclose"][0]["adjclose"]
+    except (KeyError, IndexError, TypeError):
+        adj = None
+
     candles = []
     for i, ts in enumerate(timestamps):
         o, h, l, c, v = q["open"][i], q["high"][i], q["low"][i], q["close"][i], q["volume"][i]
         if None in (o, h, l, c):
             continue
+        if adj is not None and i < len(adj) and adj[i] and c:
+            factor = adj[i] / c
+            o, h, l, c = o * factor, h * factor, l * factor, adj[i]
         candles.append({
             "date":   datetime.fromtimestamp(ts, tz=timezone.utc).strftime(date_fmt),
             "open":   round(o, 4),
@@ -88,6 +114,23 @@ def _fetch_ohlcv(symbol: str, period: str, interval: str = "1d") -> list[dict]:
 
 
 # ─── Strategy Engines ─────────────────────────────────────────────────────────
+
+def _finalize_trades(trades: list, position, candles: list) -> list:
+    """Close any still-open position at the final bar, flagged forced_exit.
+
+    Silently discarding open positions biased every strategy's results: one
+    currently underwater in an open trade reported only its closed winners,
+    and trade counts flapped between adjacent periods.
+    """
+    if position is not None and candles:
+        trades.append({
+            **position,
+            "exit_date": candles[-1]["date"],
+            "exit_price": candles[-1]["close"],
+            "forced_exit": True,
+        })
+    return trades
+
 
 def _run_rsi(candles, oversold=40, overbought=60, period=14, **_):
     closes = [c["close"] for c in candles]
@@ -102,7 +145,7 @@ def _run_rsi(candles, oversold=40, overbought=60, period=14, **_):
         elif position is not None and rsi[i] > overbought:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
-    return trades
+    return _finalize_trades(trades, position, candles)
 
 
 def _run_bollinger(candles, period=20, std_mult=2.0, **_):
@@ -118,7 +161,7 @@ def _run_bollinger(candles, period=20, std_mult=2.0, **_):
         elif position is not None and price > bb["middle"][i]:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
-    return trades
+    return _finalize_trades(trades, position, candles)
 
 
 def _run_macd(candles, fast=12, slow=26, signal=9, **_):
@@ -135,7 +178,7 @@ def _run_macd(candles, fast=12, slow=26, signal=9, **_):
         elif position is not None and mp > sp and m <= s:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
-    return trades
+    return _finalize_trades(trades, position, candles)
 
 
 def _run_ema_cross(candles, fast_period=20, slow_period=50, **_):
@@ -153,7 +196,7 @@ def _run_ema_cross(candles, fast_period=20, slow_period=50, **_):
         elif position is not None and fp > sp and f <= s:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
-    return trades
+    return _finalize_trades(trades, position, candles)
 
 
 def _run_supertrend(candles, atr_period=10, multiplier=3.0, **_):
@@ -172,7 +215,7 @@ def _run_supertrend(candles, atr_period=10, multiplier=3.0, **_):
         elif position is not None and dp == 1 and d == -1:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
-    return trades
+    return _finalize_trades(trades, position, candles)
 
 
 def _run_donchian(candles, period=20, **_):
@@ -181,25 +224,123 @@ def _run_donchian(candles, period=20, **_):
     dc     = calc_donchian(highs, lows, period)
     trades, position = [], None
     for i in range(1, len(candles)):
-        if dc["upper"][i] is None:
+        # Compare against the channel formed by the PRIOR window (index i-1).
+        # dc["upper"][i]/[i] include bar i itself, so highs[i] can never exceed
+        # dc["upper"][i] (a value can't beat a max that contains it) -> 0 trades.
+        if dc["upper"][i - 1] is None or dc["lower"][i - 1] is None:
             continue
         price, date = candles[i]["close"], candles[i]["date"]
-        prev_high   = highs[i - 1]
-        if position is None and dc["upper"][i - 1] is not None and prev_high > dc["upper"][i - 1]:
+        if position is None and highs[i] > dc["upper"][i - 1]:
             position = {"entry_date": date, "entry_price": price, "strategy": "donchian"}
-        elif position is not None and dc["lower"][i] is not None and price < dc["lower"][i]:
+        elif position is not None and lows[i] < dc["lower"][i - 1]:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
-    return trades
+    return _finalize_trades(trades, position, candles)
+
+
+def _run_rsi_pullback(candles, rsi_period=14, oversold=40, overbought=70,
+                       fast_ma=50, slow_ma=200, **_):
+    """Dip-buy in confirmed uptrend.
+
+    Entry: SMA(fast_ma) > SMA(slow_ma)  AND  RSI < oversold
+    Exit:  RSI > overbought              OR   close < SMA(fast_ma)
+    """
+    closes   = [c["close"] for c in candles]
+    rsi      = calc_rsi(closes, rsi_period)
+    sma_fast = calc_sma(closes, fast_ma)
+    sma_slow = calc_sma(closes, slow_ma)
+    trades, position = [], None
+    for i in range(1, len(candles)):
+        if rsi[i] is None or sma_fast[i] is None or sma_slow[i] is None:
+            continue
+        price, date = candles[i]["close"], candles[i]["date"]
+        in_uptrend  = sma_fast[i] > sma_slow[i]
+        if position is None and in_uptrend and rsi[i] < oversold:
+            position = {"entry_date": date, "entry_price": price, "strategy": "rsi_pullback"}
+        elif position is not None and (rsi[i] > overbought or price < sma_fast[i]):
+            trades.append({**position, "exit_date": date, "exit_price": price})
+            position = None
+    return _finalize_trades(trades, position, candles)
+
+
+def _run_keltner_breakout(candles, ema_period=20, atr_period=14, multiplier=2.0, **_):
+    """ATR-normalized breakout (volatility-aware Donchian alternative).
+
+    Upper = EMA(20) + multiplier · ATR(14)
+    Entry: close > upper
+    Exit:  close < EMA(20)
+    """
+    highs  = [c["high"]  for c in candles]
+    lows   = [c["low"]   for c in candles]
+    closes = [c["close"] for c in candles]
+    ema    = calc_ema(closes, ema_period)
+    atr    = calc_atr(highs, lows, closes, atr_period)
+    trades, position = [], None
+    for i in range(1, len(candles)):
+        if ema[i] is None or atr[i] is None:
+            continue
+        price, date = candles[i]["close"], candles[i]["date"]
+        upper       = ema[i] + multiplier * atr[i]
+        if position is None and price > upper:
+            position = {"entry_date": date, "entry_price": price, "strategy": "keltner_breakout"}
+        elif position is not None and price < ema[i]:
+            trades.append({**position, "exit_date": date, "exit_price": price})
+            position = None
+    return _finalize_trades(trades, position, candles)
+
+
+def _run_triple_ema(candles, fast_period=20, slow_period=50, trend_period=200, **_):
+    """EMA 20/50 cross gated by long-term trend filter.
+
+    Entry: EMA(20) crosses ABOVE EMA(50)  AND  close > SMA(200)
+    Exit:  EMA(20) crosses BELOW EMA(50)
+    """
+    closes    = [c["close"] for c in candles]
+    ema_fast  = calc_ema(closes, fast_period)
+    ema_slow  = calc_ema(closes, slow_period)
+    sma_trend = calc_sma(closes, trend_period)
+    trades, position = [], None
+    for i in range(1, len(candles)):
+        f, s, fp, sp, t = ema_fast[i], ema_slow[i], ema_fast[i-1], ema_slow[i-1], sma_trend[i]
+        if None in (f, s, fp, sp, t):
+            continue
+        price, date = candles[i]["close"], candles[i]["date"]
+        bull_cross  = fp < sp and f >= s
+        bear_cross  = fp > sp and f <= s
+        if position is None and bull_cross and price > t:
+            position = {"entry_date": date, "entry_price": price, "strategy": "triple_ema"}
+        elif position is not None and bear_cross:
+            trades.append({**position, "exit_date": date, "exit_price": price})
+            position = None
+    return _finalize_trades(trades, position, candles)
 
 
 _STRATEGY_MAP = {
-    "rsi":        _run_rsi,
-    "bollinger":  _run_bollinger,
-    "macd":       _run_macd,
-    "ema_cross":  _run_ema_cross,
-    "supertrend": _run_supertrend,
-    "donchian":   _run_donchian,
+    "rsi":              _run_rsi,
+    "bollinger":        _run_bollinger,
+    "macd":             _run_macd,
+    "ema_cross":        _run_ema_cross,
+    "supertrend":       _run_supertrend,
+    "donchian":         _run_donchian,
+    "rsi_pullback":     _run_rsi_pullback,
+    "keltner_breakout": _run_keltner_breakout,
+    "triple_ema":       _run_triple_ema,
+}
+
+# Bars each strategy needs before its slowest indicator produces signals.
+# Walk-forward test slices shorter than this cannot trade at all — scoring
+# them 0.0 falsely reads as "fails out-of-sample" when the real cause is
+# "window too small to even warm up".
+_STRATEGY_WARMUP_BARS = {
+    "rsi":              14,
+    "bollinger":        20,
+    "macd":             35,   # slow EMA 26 + signal 9
+    "ema_cross":        50,   # slow EMA
+    "supertrend":       10,   # ATR period
+    "donchian":         20,
+    "rsi_pullback":     200,  # SMA200 (excluded from walk-forward anyway)
+    "keltner_breakout": 20,   # EMA20 / ATR14
+    "triple_ema":       200,  # trend EMA (excluded from walk-forward anyway)
 }
 
 
@@ -268,7 +409,62 @@ def _build_equity_curve(trades: list[dict], initial_capital: float) -> list[dict
 
 # ─── Metrics ──────────────────────────────────────────────────────────────────
 
-def _calc_metrics(trades: list[dict], initial_capital: float, interval: str = "1d") -> dict:
+def _mark_to_market_equity(
+    trades: list[dict], initial_capital: float, candles: list[dict],
+) -> list[float]:
+    """Per-BAR equity series: marks open positions to each bar's close.
+
+    The old equity path updated only at trade exits, so a trade that rode a
+    -40% dip before exiting at +2% showed near-zero drawdown (inflating
+    Calmar), and Sharpe treated irregular per-trade returns as fixed-frequency
+    periods. Equity is flat (cash) outside positions.
+    """
+    idx: dict[str, int] = {}
+    for i, c in enumerate(candles):
+        idx.setdefault(c["date"], i)
+
+    spans = []
+    for t in trades:
+        ei, xi = idx.get(t["entry_date"]), idx.get(t["exit_date"])
+        if ei is None or xi is None or xi < ei:
+            continue
+        spans.append((ei, xi, t))
+    spans.sort(key=lambda s: s[0])
+
+    equity = [float(initial_capital)] * len(candles)
+    capital = float(initial_capital)
+    cursor = 0
+    for ei, xi, t in spans:
+        for i in range(cursor, min(ei + 1, len(candles))):
+            equity[i] = capital
+        entry_capital = capital
+        entry_price = t["entry_price"] or 1.0
+        for i in range(ei + 1, xi):
+            equity[i] = entry_capital * (candles[i]["close"] / entry_price)
+        # Exit applies the trade's NET return (costs included) so the series
+        # lands exactly on the compounded trade-level capital.
+        capital = entry_capital * (1 + t["return_pct"] / 100)
+        if xi < len(candles):
+            equity[xi] = capital
+        cursor = xi + 1
+    for i in range(cursor, len(candles)):
+        equity[i] = capital
+    return equity
+
+
+def _calc_metrics(
+    trades: list[dict],
+    initial_capital: float,
+    interval: str = "1d",
+    candles: Optional[list[dict]] = None,
+    risk_free_rate: Optional[float] = None,
+    periods_per_year: Optional[int] = None,
+) -> dict:
+    """Trade metrics. When `candles` is provided, drawdown/Calmar/Sharpe come
+    from the per-bar mark-to-market equity series (intra-trade dips count and
+    Sharpe annualizes actual bar-frequency returns); without candles (e.g.
+    trades aggregated across walk-forward folds) it falls back to the
+    per-trade approximation."""
     empty = {
         "total_trades": 0, "win_rate_pct": 0, "winning_trades": 0, "losing_trades": 0,
         "total_return_pct": 0, "final_capital": initial_capital,
@@ -283,15 +479,29 @@ def _calc_metrics(trades: list[dict], initial_capital: float, interval: str = "1
     losers  = [t for t in trades if t["return_pct"] <= 0]
 
     capital = initial_capital
-    peak    = capital
-    max_dd  = 0.0
-    returns = []
     for t in trades:
-        r = t["return_pct"] / 100
-        capital *= (1 + r)
-        returns.append(r)
-        peak   = max(peak, capital)
-        max_dd = max(max_dd, (peak - capital) / peak * 100)
+        capital *= (1 + t["return_pct"] / 100)
+
+    if candles:
+        equity = _mark_to_market_equity(trades, initial_capital, candles)
+        returns = [
+            equity[i] / equity[i - 1] - 1
+            for i in range(1, len(equity))
+            if equity[i - 1] > 0
+        ]
+    else:
+        equity = []
+        running = initial_capital
+        for t in trades:
+            running *= (1 + t["return_pct"] / 100)
+            equity.append(running)
+        returns = [t["return_pct"] / 100 for t in trades]
+
+    peak = initial_capital
+    max_dd = 0.0
+    for v in equity:
+        peak = max(peak, v)
+        max_dd = max(max_dd, (peak - v) / peak * 100)
 
     total_return  = (capital - initial_capital) / initial_capital * 100
     avg_gain      = sum(t["return_pct"] for t in winners) / len(winners) if winners else 0
@@ -300,13 +510,14 @@ def _calc_metrics(trades: list[dict], initial_capital: float, interval: str = "1
     gl            = abs(sum(t["return_pct"] for t in losers))
     profit_factor = round(gp / gl, 2) if gl > 0 else float("inf")
 
-    ann  = _ANNUALIZATION.get(interval, 252)
+    ann = periods_per_year or _ANNUALIZATION.get(interval, 252)
+    rf  = _DEFAULT_RISK_FREE if risk_free_rate is None else risk_free_rate
     sharpe = 0.0
     if len(returns) > 1:
         mean_r = statistics.mean(returns)
         std_r  = statistics.stdev(returns)
         if std_r > 0:
-            sharpe = round((mean_r - 0.04 / ann) / std_r * math.sqrt(ann), 2)
+            sharpe = round((mean_r - rf / ann) / std_r * math.sqrt(ann), 2)
 
     calmar = round(total_return / max_dd, 2) if max_dd > 0 else 0.0
 
@@ -327,6 +538,8 @@ def _calc_metrics(trades: list[dict], initial_capital: float, interval: str = "1
         "max_drawdown_pct": round(-max_dd, 2),
         "profit_factor":    profit_factor,
         "sharpe_ratio":     sharpe,
+        "sharpe_risk_free_pct":     round(rf * 100, 2),
+        "sharpe_periods_per_year":  ann,
         "calmar_ratio":     calmar,
         "expectancy_pct":   expectancy,
         "best_trade":       {k: best[k]  for k in ("entry_date", "exit_date", "return_pct")},
@@ -334,10 +547,53 @@ def _calc_metrics(trades: list[dict], initial_capital: float, interval: str = "1
     }
 
 
-def _buy_and_hold_return(candles: list[dict]) -> float:
+def _buy_and_hold_return(
+    candles: list[dict],
+    commission_pct: float = 0.0,
+    slippage_pct: float = 0.0,
+) -> float:
+    """Benchmark return. Pass the strategy's costs so the comparison is fair —
+    the cost-free benchmark gave buy-and-hold a structural edge in
+    vs_buy_and_hold_pct (one round trip of the same commission+slippage)."""
     if len(candles) < 2:
         return 0.0
-    return round((candles[-1]["close"] - candles[0]["close"]) / candles[0]["close"] * 100, 2)
+    gross = (candles[-1]["close"] - candles[0]["close"]) / candles[0]["close"] * 100
+    return round(gross - (commission_pct + slippage_pct) * 2, 2)
+
+
+# ─── Numeric input validation ─────────────────────────────────────────────────
+
+# Commission and slippage are per-trade percentages. 100% per side is already
+# absurd, so the cap simply rejects grossly out-of-range inputs (e.g. a value
+# passed in basis points, 250, instead of as a percent, 2.5) before they
+# silently corrupt results.
+_MAX_COST_PCT = 100.0
+
+
+def _validate_numeric_inputs(
+    initial_capital: float,
+    commission_pct: float,
+    slippage_pct: float,
+) -> Optional[str]:
+    """Return an error message if a capital/cost input is out of range, else None.
+
+    Follows the same structured-error convention as the strategy/period checks:
+    callers return ``{"error": msg}`` rather than raising. Without this, two
+    silent-corruption paths are reachable from the public tools:
+
+      * ``initial_capital <= 0`` → division by initial_capital in the trade log,
+        equity curve, and metrics (0 raises ZeroDivisionError; negative flips the
+        sign of every return).
+      * negative ``commission_pct``/``slippage_pct`` → costs become a *credit*,
+        silently inflating every trade's net return above its gross.
+    """
+    if initial_capital <= 0:
+        return f"initial_capital must be positive, got {initial_capital}"
+    if not (0 <= commission_pct <= _MAX_COST_PCT):
+        return f"commission_pct must be between 0 and {_MAX_COST_PCT}, got {commission_pct}"
+    if not (0 <= slippage_pct <= _MAX_COST_PCT):
+        return f"slippage_pct must be between 0 and {_MAX_COST_PCT}, got {slippage_pct}"
+    return None
 
 
 # ─── Public API: run_backtest ─────────────────────────────────────────────────
@@ -352,6 +608,8 @@ def run_backtest(
     interval: str = "1d",
     include_trade_log: bool = False,
     include_equity_curve: bool = False,
+    risk_free_rate: Optional[float] = None,
+    periods_per_year: Optional[int] = None,
 ) -> dict:
     strategy = strategy.lower().strip()
     period   = period.lower().strip()
@@ -364,6 +622,10 @@ def run_backtest(
     if interval not in _VALID_INTERVALS:
         return {"error": f"Invalid interval '{interval}'. Choose: 1d or 1h"}
 
+    num_err = _validate_numeric_inputs(initial_capital, commission_pct, slippage_pct)
+    if num_err:
+        return {"error": num_err}
+
     try:
         candles = _fetch_ohlcv(symbol, period, interval)
     except Exception as e:
@@ -373,10 +635,16 @@ def run_backtest(
     if len(candles) < min_bars:
         return {"error": f"Not enough data ({len(candles)} bars). Try a longer period."}
 
+    if strategy in _SMA200_STRATEGIES and len(candles) < _SMA200_MIN_BARS:
+        return {"error": (f"Strategy '{strategy}' needs ≥{_SMA200_MIN_BARS} bars "
+                          f"(SMA200 warmup); got {len(candles)}. "
+                          f"Use period='1y' or '2y'.")}
+
     raw_trades = _STRATEGY_MAP[strategy](candles)
     trades     = _apply_costs(raw_trades, commission_pct, slippage_pct)
-    metrics    = _calc_metrics(trades, initial_capital, interval)
-    bnh        = _buy_and_hold_return(candles)
+    metrics    = _calc_metrics(trades, initial_capital, interval, candles=candles,
+                               risk_free_rate=risk_free_rate, periods_per_year=periods_per_year)
+    bnh        = _buy_and_hold_return(candles, commission_pct, slippage_pct)
 
     result = {
         "symbol":                  symbol.upper(),
@@ -418,11 +686,20 @@ def compare_strategies(
     commission_pct: float = 0.1,
     slippage_pct: float = 0.05,
     interval: str = "1d",
+    risk_free_rate: Optional[float] = None,
+    periods_per_year: Optional[int] = None,
 ) -> dict:
-    """Run all 6 strategies on one symbol. Supports 1d and 1h intervals."""
+    """Run all 9 strategies on one symbol. Supports 1d and 1h intervals."""
+    period   = period.lower().strip()
     interval = interval.lower().strip()
+    if period not in _VALID_PERIODS:
+        return {"error": f"Invalid period '{period}'. Choose: {', '.join(_VALID_PERIODS)}"}
     if interval not in _VALID_INTERVALS:
         return {"error": f"Invalid interval '{interval}'. Choose: 1d or 1h"}
+
+    num_err = _validate_numeric_inputs(initial_capital, commission_pct, slippage_pct)
+    if num_err:
+        return {"error": num_err}
 
     try:
         candles = _fetch_ohlcv(symbol, period, interval)
@@ -433,11 +710,14 @@ def compare_strategies(
     if len(candles) < min_bars:
         return {"error": f"Not enough data ({len(candles)} bars)."}
 
+    sma200_ok = len(candles) >= _SMA200_MIN_BARS
+
     results = []
     for strat, fn in _STRATEGY_MAP.items():
         raw    = fn(candles)
         trades = _apply_costs(raw, commission_pct, slippage_pct)
-        m      = _calc_metrics(trades, initial_capital, interval)
+        m      = _calc_metrics(trades, initial_capital, interval, candles=candles,
+                               risk_free_rate=risk_free_rate, periods_per_year=periods_per_year)
         results.append({
             "strategy":         strat,
             "strategy_label":   _STRATEGY_LABELS[strat],
@@ -455,7 +735,13 @@ def compare_strategies(
     for i, r in enumerate(results):
         r["rank"] = i + 1
 
-    bnh = _buy_and_hold_return(candles)
+    bnh = _buy_and_hold_return(candles, commission_pct, slippage_pct)
+
+    warnings = None
+    if not sma200_ok:
+        warnings = (f"Strategies {sorted(_SMA200_STRATEGIES)} need ≥{_SMA200_MIN_BARS} "
+                    f"bars (use period='1y' or '2y') to produce signals; "
+                    f"their zero-trade results below are not meaningful.")
 
     return {
         "symbol":                  symbol.upper(),
@@ -471,6 +757,7 @@ def compare_strategies(
         "buy_and_hold_return_pct": bnh,
         "winner":                  results[0]["strategy"] if results else None,
         "ranking":                 results,
+        "warnings":                warnings,
         "disclaimer":              "Past performance does not guarantee future results.",
         "timestamp":               datetime.now(timezone.utc).isoformat(),
     }
@@ -488,6 +775,8 @@ def walk_forward_backtest(
     n_splits: int = 3,
     train_ratio: float = 0.7,
     interval: str = "1d",
+    risk_free_rate: Optional[float] = None,
+    periods_per_year: Optional[int] = None,
 ) -> dict:
     """
     Walk-forward backtesting — detect overfitting via train/test splits.
@@ -496,11 +785,16 @@ def walk_forward_backtest(
       - Train (70%): in-sample strategy simulation
       - Test  (30%): out-of-sample forward validation
 
-    Robustness score (test_return / train_return):
+    Robustness score (test_return / train_return; train/test when both are
+    negative, so losing LESS out-of-sample scores higher):
       >= 0.8  → ROBUST    (no overfitting)
       >= 0.5  → MODERATE  (some degradation)
       >= 0.2  → WEAK      (likely overfitted)
       < 0.2   → OVERFITTED (do not trade live)
+
+    Folds whose test slice is shorter than the strategy's indicator warmup
+    are flagged ``insufficient_data`` and excluded from the average — a
+    window too small to trade is not evidence of out-of-sample failure.
     """
     strategy = strategy.lower().strip()
     period   = period.lower().strip()
@@ -516,6 +810,15 @@ def walk_forward_backtest(
         return {"error": "n_splits must be between 2 and 10"}
     if not (0.5 <= train_ratio <= 0.9):
         return {"error": "train_ratio must be between 0.5 and 0.9"}
+    if strategy in _SMA200_STRATEGIES:
+        return {"error": (f"Strategy '{strategy}' requires SMA200 warmup "
+                          f"(~{_SMA200_MIN_BARS} bars) which exceeds typical "
+                          f"walk-forward fold sizes. Use run_backtest with "
+                          f"period='2y' instead, or pick a shorter-warmup strategy.")}
+
+    num_err = _validate_numeric_inputs(initial_capital, commission_pct, slippage_pct)
+    if num_err:
+        return {"error": num_err}
 
     try:
         candles = _fetch_ohlcv(symbol, period, interval)
@@ -526,11 +829,13 @@ def walk_forward_backtest(
     if len(candles) < min_bars:
         return {"error": f"Not enough data ({len(candles)} bars) for {n_splits} splits. Try longer period."}
 
-    fn        = _STRATEGY_MAP[strategy]
-    fold_size = len(candles) // n_splits
+    fn          = _STRATEGY_MAP[strategy]
+    fold_size   = len(candles) // n_splits
+    warmup_bars = _STRATEGY_WARMUP_BARS.get(strategy, 20)
 
     folds: list[dict]   = []
     all_test_trades: list[dict] = []
+    insufficient_folds = 0
 
     for fold_i in range(n_splits):
         start  = fold_i * fold_size
@@ -544,18 +849,32 @@ def walk_forward_backtest(
         if len(train_c) < 20 or len(test_c) < 5:
             continue
 
+        # A test slice too short for the strategy's slowest indicator can
+        # never trade — recording fold_rob=0.0 would falsely count it as
+        # out-of-sample failure. Mark it and exclude it from the average.
+        insufficient = len(test_c) < warmup_bars + 5
+
         train_t = _apply_costs(fn(train_c), commission_pct, slippage_pct)
         test_t  = _apply_costs(fn(test_c),  commission_pct, slippage_pct)
-        train_m = _calc_metrics(train_t, initial_capital, interval)
-        test_m  = _calc_metrics(test_t,  initial_capital, interval)
+        train_m = _calc_metrics(train_t, initial_capital, interval, candles=train_c,
+                                risk_free_rate=risk_free_rate, periods_per_year=periods_per_year)
+        test_m  = _calc_metrics(test_t,  initial_capital, interval, candles=test_c,
+                                risk_free_rate=risk_free_rate, periods_per_year=periods_per_year)
 
         all_test_trades.extend(test_t)
 
         tr, te = train_m["total_return_pct"], test_m["total_return_pct"]
-        if tr == 0:
+        if insufficient:
+            fold_rob = None
+            insufficient_folds += 1
+        elif tr == 0:
             fold_rob = 1.0 if te == 0 else 0.0
         elif tr < 0 and te < 0:
-            fold_rob = round(min(te / tr, 2.0), 2)
+            # Both windows lost money: robustness = did the test lose LESS?
+            # tr/te > 1 when the test loss is smaller than the train loss.
+            # (The old te/tr rewarded losing MORE out-of-sample: train -1%,
+            # test -2% scored a capped 2.0 — "maximally robust".)
+            fold_rob = round(max(min(tr / te, 2.0), 0.0), 2)
         elif tr < 0:
             fold_rob = 0.0
         else:
@@ -576,15 +895,23 @@ def walk_forward_backtest(
             "test_trades":           test_m["total_trades"],
             "test_sharpe":           test_m["sharpe_ratio"],
             "fold_robustness_score": fold_rob,
+            "insufficient_data":     insufficient,
         })
 
     if not folds:
         return {"error": "Could not generate any valid folds. Try a longer period or fewer splits."}
 
-    avg_train  = round(statistics.mean(f["train_return_pct"] for f in folds), 2)
-    avg_test   = round(statistics.mean(f["test_return_pct"]  for f in folds), 2)
-    avg_robust = round(statistics.mean(f["fold_robustness_score"] for f in folds), 2)
-    oos_m      = _calc_metrics(all_test_trades, initial_capital, interval)
+    scored_folds = [f for f in folds if not f["insufficient_data"]]
+    if not scored_folds:
+        return {"error": (f"Every test window is shorter than the ~{warmup_bars}-bar "
+                          f"warmup '{strategy}' needs to trade at all. Use a longer "
+                          f"period or fewer splits."), "folds": folds}
+
+    avg_train  = round(statistics.mean(f["train_return_pct"] for f in scored_folds), 2)
+    avg_test   = round(statistics.mean(f["test_return_pct"]  for f in scored_folds), 2)
+    avg_robust = round(statistics.mean(f["fold_robustness_score"] for f in scored_folds), 2)
+    oos_m      = _calc_metrics(all_test_trades, initial_capital, interval,
+                               risk_free_rate=risk_free_rate, periods_per_year=periods_per_year)
 
     if avg_robust >= 0.8:
         verdict = "ROBUST — strategy performs consistently in-sample and out-of-sample"
@@ -610,13 +937,19 @@ def walk_forward_backtest(
         "avg_train_return_pct":    avg_train,
         "avg_test_return_pct":     avg_test,
         "robustness_score":        avg_robust,
+        "scored_folds":            len(scored_folds),
+        "insufficient_data_folds": insufficient_folds,
         "verdict":                 verdict,
+        "caveat": ("No parameters are optimised on the train window (fixed "
+                   "defaults run on both slices), so this score measures "
+                   "regime consistency across windows, not parameter "
+                   "overfitting in the classical sense."),
         "oos_total_trades":        oos_m["total_trades"],
         "oos_win_rate_pct":        oos_m["win_rate_pct"],
         "oos_sharpe_ratio":        oos_m["sharpe_ratio"],
         "oos_max_drawdown_pct":    oos_m["max_drawdown_pct"],
         "oos_total_return_pct":    oos_m["total_return_pct"],
-        "buy_and_hold_return_pct": _buy_and_hold_return(candles),
+        "buy_and_hold_return_pct": _buy_and_hold_return(candles, commission_pct, slippage_pct),
         "folds":                   folds,
         "initial_capital":         round(initial_capital, 2),
         "commission_pct":          commission_pct,

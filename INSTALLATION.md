@@ -1,10 +1,12 @@
 # 🛠️ Installation Guide - TradingView MCP Server
 
+> ☁️ **This is the self-hosting guide (free, MIT).** Prefer to skip the setup entirely? The same 30+ tools are available hosted as one connector URL for Claude.ai, ChatGPT, Copilot & Cursor at **[pro.cryptosieve.com](https://pro.cryptosieve.com)** — from $9/mo, 3-day free trial.
+
 ## Prerequisites
 
-- **Python 3.8+** (Python 3.10+ recommended)
+- **Python 3.10-3.13**
 - **UV Package Manager** (for dependency management)
-- **Claude Desktop** (for MCP integration)
+- **Claude Desktop or Codex** (for MCP integration)
 - **Internet Connection** (for TradingView data access)
 
 ## Step-by-Step Installation
@@ -35,7 +37,37 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 uv --version
 ```
 
-### 2. Configure Claude Desktop
+### 2. Configure Your MCP Client
+
+#### Codex Plugin
+
+This repository includes mcp-only Codex plugin metadata:
+
+- `.codex-plugin/plugin.json`
+- `.codex-mcp.json`
+
+The bundled Codex MCP configuration uses the PyPI package:
+
+```json
+{
+  "mcpServers": {
+    "tradingview": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "tradingview-mcp-server",
+        "tradingview-mcp"
+      ]
+    }
+  }
+}
+```
+
+After enabling the plugin in Codex, restart Codex so the MCP server is loaded in the next session.
+
+Depending on your Codex version, `codex mcp list` may show registered MCP servers. To verify tool availability, start a fresh Codex session and ask it to show the available TradingView tools.
+
+#### Claude Desktop
 
 #### Find Claude Desktop Config File:
 

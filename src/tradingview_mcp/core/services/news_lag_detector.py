@@ -16,8 +16,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from tradingview_mcp.core.services.data_fetcher import fetch_ohlcv
-from tradingview_mcp.core.services.news_service import fetch_news_summary
-from tradingview_mcp.core.services.sentiment_service import analyze_sentiment
+# news_service / sentiment_service were replaced upstream by the licensed
+# Marketaux feed; both helpers keep their old signatures and output shape.
+from tradingview_mcp.core.services.marketaux_service import (
+    fetch_news_summary,
+    analyze_sentiment,
+)
 
 
 def detect_news_lag(
