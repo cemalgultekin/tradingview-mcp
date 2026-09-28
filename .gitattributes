@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings even when checked out on Windows
+# (core.autocrlf=true would otherwise give them CRLF, and bash on Linux/macOS
+# fails with "bad interpreter: /usr/bin/env bash^M").
+*.sh text eol=lf
+
+# PowerShell is happy either way, but pin it so the file looks the same
+# everywhere it is edited.
+*.ps1 text eol=crlf
