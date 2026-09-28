@@ -781,10 +781,35 @@ async def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: st
 
     tech_momentum = tech.get("market_sentiment", {}).get("momentum", "") if isinstance(tech, dict) else ""
     tech_bullish = tech_momentum == "Bullish"
-    sent_bullish = sentiment.get("sentiment_score", 0) > 0.1
-    signals_agree = tech_bullish == sent_bullish
-    confidence = "HIGH" if signals_agree else "MIXED"
     tech_signal = tech.get("market_sentiment", {}).get("buy_sell_signal", "N/A") if isinstance(tech, dict) else "N/A"
+
+    # FORK PATCH: gate the confluence verdict on sentiment actually existing.
+    # posts_analyzed == 0 covers no MARKETAUX_API_TOKEN, no articles for the
+    # symbol, and the error envelope substituted above when the fetch raised.
+    # Without this, an absent score defaults to 0.0, so sent_bullish is False
+    # and a non-bullish technical read makes False == False -> signals_agree
+    # True -> confidence "HIGH": a high-confidence agreement with sentiment
+    # that was never fetched. The recommendation string disclosed
+    # "(0 articles analyzed)", but `confidence` is the field callers key on.
+    sentiment_measured = sentiment.get("posts_analyzed", 0) > 0
+
+    if not sentiment_measured:
+        signals_agree = None
+        confidence = "TECHNICAL_ONLY"
+        recommendation = (
+            f"Technical {tech_signal}; no news sentiment available "
+            "(0 articles analyzed) — confluence not assessed"
+        )
+    else:
+        sent_bullish = sentiment.get("sentiment_score", 0) > 0.1
+        signals_agree = tech_bullish == sent_bullish
+        confidence = "HIGH" if signals_agree else "MIXED"
+        recommendation = (
+            f"Technical {tech_signal} "
+            f"{'confirmed by' if signals_agree else 'conflicts with'} "
+            f"{sentiment.get('sentiment_label', 'Neutral')} news sentiment "
+            f"({sentiment.get('posts_analyzed', 0)} articles analyzed)"
+        )
 
     return {
         "symbol": symbol,
@@ -796,12 +821,8 @@ async def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: st
         "confluence": {
             "signals_agree": signals_agree,
             "confidence": confidence,
-            "recommendation": (
-                f"Technical {tech_signal} "
-                f"{'confirmed by' if signals_agree else 'conflicts with'} "
-                f"{sentiment.get('sentiment_label', 'Neutral')} news sentiment "
-                f"({sentiment.get('posts_analyzed', 0)} articles analyzed)"
-            ),
+            "sentiment_available": sentiment_measured,
+            "recommendation": recommendation,
         },
     }
 
