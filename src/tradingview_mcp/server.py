@@ -1299,6 +1299,12 @@ def news_price_lag_detector(
     Returns:
         Sentiment-price alignment, volume spike follow-through analysis,
         news tradability assessment, momentum at multiple horizons.
+
+        Sentiment needs MARKETAUX_API_TOKEN. Without it — or when the feed has
+        no articles for the symbol — ``sentiment.available`` is False,
+        ``sentiment.score`` is None and ``sentiment_price_alignment`` is
+        "UNAVAILABLE". The price-based fields (momentum, volume spikes,
+        tradability) are computed either way.
     """
     return _detect_news_lag(symbol, period, interval, category)
 

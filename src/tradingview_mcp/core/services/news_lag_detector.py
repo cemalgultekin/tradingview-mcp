@@ -133,10 +133,27 @@ def detect_news_lag(
         avg_spike_move = 0
 
     # ── Sentiment-price alignment ────────────────────────────────────────────
+    # posts_analyzed == 0 means no sentiment was measured at all: no Marketaux
+    # token, no articles for this symbol, or the fetch raised. Guard on it
+    # BEFORE the label comparisons — both no-data shapes used to produce a
+    # confident verdict from nothing. Without a token the label is
+    # "Unavailable", which matches neither the bullish/bearish nor the
+    # "Neutral" branch, so it fell through to the catch-all else and reported
+    # DIVERGENT with a "potential reversal signal" note. With a token but zero
+    # articles the score defaults to 0.0, which labels as "Neutral" and
+    # asserted neutral sentiment that was likewise never measured.
     sent_label = sentiment.get("sentiment_label", "Neutral")
     sent_score = sentiment.get("sentiment_score", 0)
+    posts_analyzed = sentiment.get("posts_analyzed", 0)
+    sentiment_available = posts_analyzed > 0
+    sentiment_error = sentiment.get("error")
 
-    if momentum["7d"] is not None:
+    if not sentiment_available:
+        sent_label = "Unavailable"
+        alignment = "UNAVAILABLE"
+        reason = sentiment_error or "no news articles found for this symbol"
+        alignment_note = f"No news sentiment available ({reason}) — alignment not assessed"
+    elif momentum["7d"] is not None:
         if (sent_label in ("Bullish", "Very Bullish") and momentum["7d"] > 0) or \
            (sent_label in ("Bearish", "Very Bearish") and momentum["7d"] < 0):
             alignment = "ALIGNED"
@@ -171,8 +188,14 @@ def detect_news_lag(
         "date_to": candles[-1]["date"],
         "sentiment": {
             "label": sent_label,
-            "score": sent_score,
-            "posts_analyzed": sentiment.get("posts_analyzed", 0),
+            # None rather than 0.0 when nothing was measured: a 0.0 score is
+            # indistinguishable from a genuine neutral reading.
+            "score": sent_score if sentiment_available else None,
+            "available": sentiment_available,
+            "unavailable_reason": None if sentiment_available else (
+                sentiment_error or "no news articles found for this symbol"
+            ),
+            "posts_analyzed": posts_analyzed,
             "bullish_count": sentiment.get("bullish_count", 0),
             "bearish_count": sentiment.get("bearish_count", 0),
         },
